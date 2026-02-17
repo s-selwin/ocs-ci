@@ -1,6 +1,10 @@
 import logging
 import pytest
-from ocs_ci.framework.pytest_customization.marks import brown_squad, skipif_compact_mode
+from ocs_ci.framework.pytest_customization.marks import (
+    brown_squad,
+    skipif_compact_mode,
+    skipif_ibm_power,
+)
 from ocs_ci.framework.testlib import (
     tier4a,
     tier4b,
@@ -8,6 +12,7 @@ from ocs_ci.framework.testlib import (
     ignore_leftovers,
     skipif_external_mode,
     skipif_ibm_cloud,
+    skipif_bm,
 )
 from ocs_ci.framework import config
 from ocs_ci.ocs import machine, constants
@@ -245,6 +250,8 @@ class TestAutomatedRecoveryFromFailedNodes(ManageTest):
 @tier4a
 @skipif_ibm_cloud
 @skipif_compact_mode
+@skipif_bm
+@skipif_ibm_power
 class TestAutomatedRecoveryFromStoppedNodes(ManageTest):
 
     osd_worker_node = None
@@ -255,31 +262,39 @@ class TestAutomatedRecoveryFromStoppedNodes(ManageTest):
     @pytest.fixture(autouse=True)
     def teardown(self, request, nodes):
         def finalizer():
-            if self.extra_node:
-                nodes.terminate_nodes([self.osd_worker_node], wait=True)
-                log.info(
-                    f"Successfully terminated node : "
-                    f"{self.osd_worker_node.name} instance"
-                )
-            else:
-                is_recovered = recover_node_to_ready_state(self.osd_worker_node)
-                if not is_recovered:
-                    log.warning(
-                        f"The recovery of the osd worker node "
-                        f"{self.osd_worker_node.name} failed. Adding a new OCS worker node..."
+            # PROTECT THE BLOCK: ensure the node object was actually created/assigned
+            if self.osd_worker_node is not None:
+                if self.extra_node:
+                    nodes.terminate_nodes([self.osd_worker_node], wait=True)
+                    log.info(
+                        f"Successfully terminated node: {self.osd_worker_node.name} instance"
                     )
-                    if deployment_type == "ipi":
-                        add_new_nodes_and_label_after_node_failure_ipi(
-                            self.machineset_name
-                        )
                 else:
-                    log.info("Wait for node count to be equal to original count")
-                    wait_for_node_count_to_reach_status(node_count=initial_node_count)
-                    log.info("Node count matched")
+                    is_recovered = recover_node_to_ready_state(self.osd_worker_node)
+                    if not is_recovered:
+                        log.warning(
+                            f"The recovery of the osd worker node "
+                            f"{self.osd_worker_node.name} failed. Adding a new OCS worker node..."
+                        )
+                        if deployment_type == "ipi":
+                            add_new_nodes_and_label_after_node_failure_ipi(
+                                self.machineset_name
+                            )
+                    else:
+                        log.info("Wait for node count to be equal to original count")
+                        wait_for_node_count_to_reach_status(
+                            node_count=initial_node_count
+                        )
+                        log.info("Node count matched")
+            else:
+                log.warning(
+                    "osd_worker_node was never initialized. Skipping node-specific recovery."
+                )
 
+            # Cluster Health Check should run regardless of whether the specific node was found
             ceph_health_check()
 
-            if deployment_type == "ipi":
+            if deployment_type == "ipi" and self.machineset_name:
                 machine.wait_for_ready_replica_count_to_reach_expected_value(
                     self.machineset_name,
                     expected_value=self.start_ready_replica_count,
@@ -315,7 +330,6 @@ class TestAutomatedRecoveryFromStoppedNodes(ManageTest):
         ],
     )
     @skipif_external_mode
-    @skipif_ibm_cloud
     def test_automated_recovery_from_stopped_node_and_start(
         self, nodes, additional_node
     ):
