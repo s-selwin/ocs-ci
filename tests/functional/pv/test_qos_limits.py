@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ from ocs_ci.helpers import helpers
 from ocs_ci.ocs import constants
 from ocs_ci.ocs.exceptions import CommandFailed, TimeoutExpiredError
 from ocs_ci.ocs.resources.pod import Pod
+from ocs_ci.ocs.resources.pvc import PVC
 from ocs_ci.utility.utils import exec_cmd, TimeoutSampler
 
 logger = logging.getLogger(__name__)
@@ -92,9 +94,10 @@ class TestVolumeAttributesClassQoS(ManageTest):
 
     @pytest.fixture(autouse=True, scope="class")
     def setup_qos_classes(self, request):
-        """Provisions Silver, Gold VolumeAttributesClass resources once for the test class."""
+        """Provisions Silver, Gold, and Unthrottled VolumeAttributesClass resources once for the test class."""
         request.cls.silver_vac_name = "silver-qos-tier"
         request.cls.gold_vac_name = "gold-qos-tier"
+        request.cls.unthrottled_vac_name = "unthrottled-qos-tier"
 
         request.cls.silver_limits = {
             "rbps": "1048576",
@@ -108,15 +111,25 @@ class TestVolumeAttributesClassQoS(ManageTest):
             "riops": "2000",
             "wiops": "2000",
         }
+        # "max" removes the device rate limit; used by the live-mutation and
+        # profile-removal scenarios (QOS-TC-10 / QOS-TC-11).
+        request.cls.unthrottled_limits = {
+            "rbps": "max",
+            "wbps": "max",
+            "riops": "max",
+            "wiops": "max",
+        }
 
         tmp_silver = None
         tmp_gold = None
+        tmp_unthrottled = None
 
         def cleanup():
             logger.info("Deleting VolumeAttributesClass resources")
             for vac_name in (
                 request.cls.silver_vac_name,
                 request.cls.gold_vac_name,
+                request.cls.unthrottled_vac_name,
             ):
                 try:
                     exec_cmd(
@@ -126,7 +139,7 @@ class TestVolumeAttributesClassQoS(ManageTest):
                 except Exception as ex:
                     logger.warning(f"Failed to delete VAC {vac_name}: {ex}")
 
-            for tmp_file in (tmp_silver, tmp_gold):
+            for tmp_file in (tmp_silver, tmp_gold, tmp_unthrottled):
                 if tmp_file and os.path.exists(tmp_file):
                     try:
                         os.remove(tmp_file)
@@ -162,6 +175,19 @@ class TestVolumeAttributesClassQoS(ManageTest):
             },
         }
 
+        unthrottled_manifest = {
+            "apiVersion": "storage.k8s.io/v1",
+            "kind": "VolumeAttributesClass",
+            "metadata": {"name": request.cls.unthrottled_vac_name},
+            "driverName": "openshift-storage.rbd.csi.ceph.com",
+            "parameters": {
+                "maxReadBps": request.cls.unthrottled_limits["rbps"],
+                "maxWriteBps": request.cls.unthrottled_limits["wbps"],
+                "maxReadIops": request.cls.unthrottled_limits["riops"],
+                "maxWriteIops": request.cls.unthrottled_limits["wiops"],
+            },
+        }
+
         logger.info("Writing VolumeAttributesClass manifests to temp files")
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as sf:
             json.dump(silver_manifest, sf)
@@ -171,8 +197,13 @@ class TestVolumeAttributesClassQoS(ManageTest):
             json.dump(gold_manifest, gf)
             tmp_gold = gf.name
 
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as uf:
+            json.dump(unthrottled_manifest, uf)
+            tmp_unthrottled = uf.name
+
         exec_cmd(f"oc apply -f {tmp_silver}")
         exec_cmd(f"oc apply -f {tmp_gold}")
+        exec_cmd(f"oc apply -f {tmp_unthrottled}")
 
     def verify_node_cgroup_throttling(
         self, pod_obj, expected_limits, timeout=60, sleep=5
@@ -198,6 +229,21 @@ class TestVolumeAttributesClassQoS(ManageTest):
             # unavailable node cannot block on exec_cmd's 600s default timeout.
             res = exec_cmd(find_cmd, shell=True, ignore_error=True, timeout=timeout)
             output = res.stdout.decode() if res.stdout else ""
+
+            # Unthrottled tier: every limit is "max". The device is considered
+            # un-throttled once the previously applied numeric Silver/Gold rbps
+            # values are no longer present in io.max.
+            if all(val == "max" for val in expected_limits.values()):
+                stale_values = (
+                    f"rbps={self.silver_limits['rbps']}",
+                    f"rbps={self.gold_limits['rbps']}",
+                )
+                if any(stale in output for stale in stale_values):
+                    logger.debug(
+                        "Previous throttle values still present in io.max. Retrying..."
+                    )
+                    return False
+                return output if output.strip() else "UNTHROTTLED_CLEARED"
 
             if not output.strip():
                 return False
@@ -463,3 +509,249 @@ class TestVolumeAttributesClassQoS(ManageTest):
                     out_yaml_format=False,
                     container_name=container_name,
                 )
+
+    def _guaranteed_fs_pod_dict(self, pod_name, namespace, pvc_name):
+        """Builds a Guaranteed-QoS pod spec mounting a filesystem PVC.
+
+        A deep copy of the shared container preset is used so repeated pod
+        creation (e.g. the restart flows in QOS-TC-10 / QOS-TC-11) never mutates
+        the module-level constant.
+        """
+        return {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": pod_name, "namespace": namespace},
+            "spec": {
+                "containers": copy.deepcopy(GUARANTEED_FS_CONTAINERS),
+                "volumes": [
+                    {
+                        "name": "vol-data",
+                        "persistentVolumeClaim": {"claimName": pvc_name},
+                    }
+                ],
+            },
+        }
+
+    def _validate_filesystem_io(self, pod_obj, test_id):
+        """Runs sequential write then read I/O on the pod's mounted filesystem.
+
+        exec_cmd_on_pod raises CommandFailed on a non-zero exit, so either dd
+        failing fails the test.
+        """
+        io_target = "/mnt/storage/test_io.img"
+
+        logger.assertion(f"[{test_id}] Write I/O to {io_target} expected to succeed")
+        pod_obj.exec_cmd_on_pod(
+            f"dd if=/dev/zero of={io_target} bs=1M count=20 conv=fsync status=progress",
+            out_yaml_format=False,
+        )
+
+        logger.assertion(f"[{test_id}] Read I/O from {io_target} expected to succeed")
+        pod_obj.exec_cmd_on_pod(
+            f"dd if={io_target} of=/dev/null bs=1M count=20 status=progress",
+            out_yaml_format=False,
+        )
+
+    def test_qos_07_volume_cloning_vac_override(
+        self, project_factory, test_resources_cleanup
+    ):
+        """QOS-TC-07: QoS class mapping on PVC-to-PVC volume cloning.
+
+        A cloned PVC must honour the VolumeAttributesClass patched onto the
+        clone itself, overriding whatever tier the source PVC carried.
+        """
+        proj = project_factory()
+
+        logger.test_step("[QOS-TC-07] Provision source PVC and bind Silver VAC")
+        source_pvc_obj = helpers.create_pvc(
+            sc_name=constants.DEFAULT_STORAGECLASS_RBD,
+            size="10Gi",
+            namespace=proj.namespace,
+            access_mode=constants.ACCESS_MODE_RWO,
+            volume_mode=constants.VOLUME_MODE_FILESYSTEM,
+        )
+        test_resources_cleanup["pvcs"].append(source_pvc_obj)
+        helpers.wait_for_resource_state(
+            source_pvc_obj, constants.STATUS_BOUND, timeout=180
+        )
+        silver_patch = json.dumps(
+            {"spec": {"volumeAttributesClassName": self.silver_vac_name}}
+        )
+        source_pvc_obj.ocp.patch(
+            resource_name=source_pvc_obj.name,
+            params=silver_patch,
+            format_type="merge",
+        )
+
+        logger.test_step("[QOS-TC-07] Clone the source PVC")
+        clone_pvc_dict = {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": helpers.create_unique_resource_name("clone", "pvc"),
+                "namespace": proj.namespace,
+            },
+            "spec": {
+                "accessModes": [constants.ACCESS_MODE_RWO],
+                "volumeMode": constants.VOLUME_MODE_FILESYSTEM,
+                "resources": {"requests": {"storage": "10Gi"}},
+                "storageClassName": constants.DEFAULT_STORAGECLASS_RBD,
+                "dataSource": {
+                    "kind": "PersistentVolumeClaim",
+                    "name": source_pvc_obj.name,
+                },
+            },
+        }
+        cloned_pvc_obj = PVC(**clone_pvc_dict)
+        cloned_pvc_obj.create()
+        test_resources_cleanup["pvcs"].append(cloned_pvc_obj)
+        helpers.wait_for_resource_state(
+            cloned_pvc_obj, constants.STATUS_BOUND, timeout=300
+        )
+
+        logger.test_step("[QOS-TC-07] Override the clone with Gold VAC")
+        gold_patch = json.dumps(
+            {"spec": {"volumeAttributesClassName": self.gold_vac_name}}
+        )
+        cloned_pvc_obj.ocp.patch(
+            resource_name=cloned_pvc_obj.name,
+            params=gold_patch,
+            format_type="merge",
+        )
+
+        logger.test_step("[QOS-TC-07] Deploy Guaranteed pod on the cloned volume")
+        pod_dict = self._guaranteed_fs_pod_dict(
+            "cloned-qos-pod", proj.namespace, cloned_pvc_obj.name
+        )
+        pod_obj = Pod(**pod_dict)
+        pod_obj.create()
+        test_resources_cleanup["pods"].append(pod_obj)
+        helpers.wait_for_resource_state(pod_obj, constants.STATUS_RUNNING, timeout=420)
+
+        logger.test_step("[QOS-TC-07] Verify Gold VAC limits govern the clone")
+        self.verify_node_cgroup_throttling(pod_obj, self.gold_limits)
+
+        logger.test_step("[QOS-TC-07] Validate active I/O on the cloned volume")
+        self._validate_filesystem_io(pod_obj, "QOS-TC-07")
+
+    def test_qos_10_live_mutation_to_unthrottled(
+        self, project_factory, test_resources_cleanup
+    ):
+        """QOS-TC-10: Live QoS profile update from Silver to Unthrottled/Max.
+
+        Patching the PVC to the unthrottled VAC and remounting must clear the
+        previously applied device throttling.
+        """
+        proj = project_factory()
+
+        logger.test_step("[QOS-TC-10] Provision PVC and bind Silver VAC")
+        pvc_obj = helpers.create_pvc(
+            sc_name=constants.DEFAULT_STORAGECLASS_RBD,
+            size="10Gi",
+            namespace=proj.namespace,
+            access_mode=constants.ACCESS_MODE_RWO,
+            volume_mode=constants.VOLUME_MODE_FILESYSTEM,
+        )
+        test_resources_cleanup["pvcs"].append(pvc_obj)
+        helpers.wait_for_resource_state(pvc_obj, constants.STATUS_BOUND, timeout=180)
+        silver_patch = json.dumps(
+            {"spec": {"volumeAttributesClassName": self.silver_vac_name}}
+        )
+        pvc_obj.ocp.patch(
+            resource_name=pvc_obj.name, params=silver_patch, format_type="merge"
+        )
+
+        logger.test_step("[QOS-TC-10] Attach pod and verify initial Silver limits")
+        pod_dict = self._guaranteed_fs_pod_dict(
+            "mutation-qos-pod", proj.namespace, pvc_obj.name
+        )
+        pod_obj = Pod(**pod_dict)
+        pod_obj.create()
+        test_resources_cleanup["pods"].append(pod_obj)
+        helpers.wait_for_resource_state(pod_obj, constants.STATUS_RUNNING, timeout=420)
+        self.verify_node_cgroup_throttling(pod_obj, self.silver_limits)
+
+        logger.test_step("[QOS-TC-10] Patch PVC to the unthrottled VAC")
+        unthrottled_patch = json.dumps(
+            {"spec": {"volumeAttributesClassName": self.unthrottled_vac_name}}
+        )
+        pvc_obj.ocp.patch(
+            resource_name=pvc_obj.name,
+            params=unthrottled_patch,
+            format_type="merge",
+        )
+
+        logger.test_step("[QOS-TC-10] Restart pod to remount with updated limits")
+        pod_obj.delete()
+        pod_obj.ocp.wait_for_delete(resource_name=pod_obj.name)
+        new_pod_obj = Pod(**pod_dict)
+        new_pod_obj.create()
+        test_resources_cleanup["pods"].append(new_pod_obj)
+        helpers.wait_for_resource_state(
+            new_pod_obj, constants.STATUS_RUNNING, timeout=420
+        )
+
+        logger.test_step("[QOS-TC-10] Verify io.max throttling is cleared")
+        self.verify_node_cgroup_throttling(new_pod_obj, self.unthrottled_limits)
+
+        logger.test_step("[QOS-TC-10] Validate active I/O after limits are cleared")
+        self._validate_filesystem_io(new_pod_obj, "QOS-TC-10")
+
+    def test_qos_11_qos_profile_removal(self, project_factory, test_resources_cleanup):
+        """QOS-TC-11: QoS profile removal / unset.
+
+        Moving a throttled PVC to the unthrottled VAC and remounting must reset
+        io.max back to the default (max) throughput.
+        """
+        proj = project_factory()
+
+        logger.test_step("[QOS-TC-11] Provision PVC and bind Silver VAC")
+        pvc_obj = helpers.create_pvc(
+            sc_name=constants.DEFAULT_STORAGECLASS_RBD,
+            size="10Gi",
+            namespace=proj.namespace,
+            access_mode=constants.ACCESS_MODE_RWO,
+            volume_mode=constants.VOLUME_MODE_FILESYSTEM,
+        )
+        test_resources_cleanup["pvcs"].append(pvc_obj)
+        helpers.wait_for_resource_state(pvc_obj, constants.STATUS_BOUND, timeout=180)
+        silver_patch = json.dumps(
+            {"spec": {"volumeAttributesClassName": self.silver_vac_name}}
+        )
+        pvc_obj.ocp.patch(
+            resource_name=pvc_obj.name, params=silver_patch, format_type="merge"
+        )
+
+        logger.test_step("[QOS-TC-11] Attach pod and verify initial Silver limits")
+        pod_dict = self._guaranteed_fs_pod_dict(
+            "removal-qos-pod", proj.namespace, pvc_obj.name
+        )
+        pod_obj = Pod(**pod_dict)
+        pod_obj.create()
+        test_resources_cleanup["pods"].append(pod_obj)
+        helpers.wait_for_resource_state(pod_obj, constants.STATUS_RUNNING, timeout=420)
+        self.verify_node_cgroup_throttling(pod_obj, self.silver_limits)
+
+        logger.test_step("[QOS-TC-11] Unset the QoS profile via the unthrottled VAC")
+        unset_patch = json.dumps(
+            {"spec": {"volumeAttributesClassName": self.unthrottled_vac_name}}
+        )
+        pvc_obj.ocp.patch(
+            resource_name=pvc_obj.name, params=unset_patch, format_type="merge"
+        )
+
+        logger.test_step("[QOS-TC-11] Restart pod to remount with limits removed")
+        pod_obj.delete()
+        pod_obj.ocp.wait_for_delete(resource_name=pod_obj.name)
+        new_pod_obj = Pod(**pod_dict)
+        new_pod_obj.create()
+        test_resources_cleanup["pods"].append(new_pod_obj)
+        helpers.wait_for_resource_state(
+            new_pod_obj, constants.STATUS_RUNNING, timeout=420
+        )
+
+        logger.test_step("[QOS-TC-11] Verify io.max reset to default throughput")
+        self.verify_node_cgroup_throttling(new_pod_obj, self.unthrottled_limits)
+
+        logger.test_step("[QOS-TC-11] Validate active I/O after profile removal")
+        self._validate_filesystem_io(new_pod_obj, "QOS-TC-11")
