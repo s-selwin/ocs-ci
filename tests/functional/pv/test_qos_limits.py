@@ -208,7 +208,12 @@ class TestVolumeAttributesClassQoS(ManageTest):
     def verify_node_cgroup_throttling(
         self, pod_obj, expected_limits, timeout=60, sleep=5
     ):
-        """Scrapes active kernel cgroup mappings dynamically with polling retry logic until expected limits appear."""
+        """Polls the pod's kernel cgroup io.max until it matches expected_limits.
+
+        For a throttled tier this waits until every limit appears; for the
+        unthrottled tier (all limits "max") it waits until the prior Silver/Gold
+        throttle values have disappeared.
+        """
         pod_data = pod_obj.get()
         node_name = pod_data["spec"]["nodeName"]
         pod_uid = pod_data["metadata"]["uid"]
@@ -230,9 +235,14 @@ class TestVolumeAttributesClassQoS(ManageTest):
             res = exec_cmd(find_cmd, shell=True, ignore_error=True, timeout=timeout)
             output = res.stdout.decode() if res.stdout else ""
 
+            # Nothing scraped yet (debug pod or the pod's io.max not ready) —
+            # always retry so an empty read is never mistaken for a result.
+            if not output.strip():
+                return False
+
             # Unthrottled tier: every limit is "max". The device is considered
-            # un-throttled once the previously applied numeric Silver/Gold rbps
-            # values are no longer present in io.max.
+            # un-throttled once the pod's io.max has been scraped and no longer
+            # carries the previously applied numeric Silver/Gold rbps values.
             if all(val == "max" for val in expected_limits.values()):
                 stale_values = (
                     f"rbps={self.silver_limits['rbps']}",
@@ -243,10 +253,7 @@ class TestVolumeAttributesClassQoS(ManageTest):
                         "Previous throttle values still present in io.max. Retrying..."
                     )
                     return False
-                return output if output.strip() else "UNTHROTTLED_CLEARED"
-
-            if not output.strip():
-                return False
+                return output
 
             for key, val in expected_limits.items():
                 expected_str = f"{key}={val}"
@@ -283,15 +290,15 @@ class TestVolumeAttributesClassQoS(ManageTest):
         )
         logger.debug(f"Matched cgroup io.max output:\n{matched_output}")
         # =========================================================================
-        # PARAMETRIZED TEST MATRIX (QOS-TC-01 through QOS-TC-06)
+        # PARAMETRIZED BASELINE QoS MATRIX (access mode x volume mode x QoS class)
         # =========================================================================
 
     @pytest.mark.parametrize(
         "test_id, access_mode, volume_mode, is_gold_vac, pod_name, containers_spec, expected_qos_class, is_read_only",
         [
-            # QOS-TC-01: Guaranteed Pod + Fresh Filesystem RWO Baseline
+            # Guaranteed pod + fresh filesystem RWO baseline
             (
-                "QOS-TC-01",
+                "guaranteed-fs-rwo",
                 constants.ACCESS_MODE_RWO,
                 constants.VOLUME_MODE_FILESYSTEM,
                 False,
@@ -300,9 +307,9 @@ class TestVolumeAttributesClassQoS(ManageTest):
                 "Guaranteed",
                 False,
             ),
-            # QOS-TC-02: Burstable Pod + Fresh Filesystem RWOP Validation
+            # Burstable pod + fresh filesystem RWOP validation
             (
-                "QOS-TC-02",
+                "burstable-fs-rwop",
                 constants.ACCESS_MODE_RWOP,
                 constants.VOLUME_MODE_FILESYSTEM,
                 False,
@@ -311,9 +318,9 @@ class TestVolumeAttributesClassQoS(ManageTest):
                 "Burstable",
                 False,
             ),
-            # QOS-TC-03: BestEffort Pod + Fresh Block RWX Multi-Volume Isolation
+            # BestEffort pod + fresh block RWX multi-container isolation
             (
-                "QOS-TC-03",
+                "besteffort-block-rwx-multicontainer",
                 constants.ACCESS_MODE_RWX,
                 constants.VOLUME_MODE_BLOCK,
                 False,
@@ -322,9 +329,9 @@ class TestVolumeAttributesClassQoS(ManageTest):
                 "BestEffort",
                 False,
             ),
-            # QOS-TC-04: Guaranteed Class + Fresh Block RWO Mapping
+            # Guaranteed pod + fresh block RWO mapping
             (
-                "QOS-TC-04",
+                "guaranteed-block-rwo",
                 constants.ACCESS_MODE_RWO,
                 constants.VOLUME_MODE_BLOCK,
                 False,
@@ -333,9 +340,9 @@ class TestVolumeAttributesClassQoS(ManageTest):
                 "Guaranteed",
                 False,
             ),
-            # QOS-TC-05: Burstable Class + Fresh Block RWOP Mapping
+            # Burstable pod + fresh block RWOP mapping
             (
-                "QOS-TC-05",
+                "burstable-block-rwop",
                 constants.ACCESS_MODE_RWOP,
                 constants.VOLUME_MODE_BLOCK,
                 False,
@@ -344,9 +351,9 @@ class TestVolumeAttributesClassQoS(ManageTest):
                 "Burstable",
                 False,
             ),
-            # QOS-TC-06: Read-Only (ROX) Block Mode Evaluation
+            # Read-only (ROX) block mode on the Gold tier
             (
-                "QOS-TC-06",
+                "readonly-block-gold",
                 constants.ACCESS_MODE_RWO,
                 constants.VOLUME_MODE_BLOCK,
                 True,  # Gold VAC Tier
@@ -357,12 +364,12 @@ class TestVolumeAttributesClassQoS(ManageTest):
             ),
         ],
         ids=[
-            "QOS-TC-01",
-            "QOS-TC-02",
-            "QOS-TC-03",
-            "QOS-TC-04",
-            "QOS-TC-05",
-            "QOS-TC-06",
+            "guaranteed-fs-rwo",
+            "burstable-fs-rwop",
+            "besteffort-block-rwx-multicontainer",
+            "guaranteed-block-rwo",
+            "burstable-block-rwop",
+            "readonly-block-gold",
         ],
     )
     def test_volume_attributes_class_qos(
@@ -514,8 +521,8 @@ class TestVolumeAttributesClassQoS(ManageTest):
         """Builds a Guaranteed-QoS pod spec mounting a filesystem PVC.
 
         A deep copy of the shared container preset is used so repeated pod
-        creation (e.g. the restart flows in QOS-TC-10 / QOS-TC-11) never mutates
-        the module-level constant.
+        creation (e.g. the VAC-transition restart flows) never mutates the
+        module-level constant.
         """
         return {
             "apiVersion": "v1",
@@ -552,17 +559,18 @@ class TestVolumeAttributesClassQoS(ManageTest):
             out_yaml_format=False,
         )
 
-    def test_qos_07_volume_cloning_vac_override(
+    def test_qos_volume_cloning_vac_override(
         self, project_factory, test_resources_cleanup
     ):
-        """QOS-TC-07: QoS class mapping on PVC-to-PVC volume cloning.
+        """QoS class mapping on PVC-to-PVC volume cloning.
 
         A cloned PVC must honour the VolumeAttributesClass patched onto the
         clone itself, overriding whatever tier the source PVC carried.
         """
+        test_id = "volume-cloning-vac-override"
         proj = project_factory()
 
-        logger.test_step("[QOS-TC-07] Provision source PVC and bind Silver VAC")
+        logger.test_step(f"[{test_id}] Provision source PVC and bind Silver VAC")
         source_pvc_obj = helpers.create_pvc(
             sc_name=constants.DEFAULT_STORAGECLASS_RBD,
             size="10Gi",
@@ -574,6 +582,8 @@ class TestVolumeAttributesClassQoS(ManageTest):
         helpers.wait_for_resource_state(
             source_pvc_obj, constants.STATUS_BOUND, timeout=180
         )
+        # Bind the source to Silver purely so the clone has a tier to override;
+        # the source throttling itself is not asserted in this test.
         silver_patch = json.dumps(
             {"spec": {"volumeAttributesClassName": self.silver_vac_name}}
         )
@@ -583,7 +593,7 @@ class TestVolumeAttributesClassQoS(ManageTest):
             format_type="merge",
         )
 
-        logger.test_step("[QOS-TC-07] Clone the source PVC")
+        logger.test_step(f"[{test_id}] Clone the source PVC")
         clone_pvc_dict = {
             "apiVersion": "v1",
             "kind": "PersistentVolumeClaim",
@@ -609,7 +619,7 @@ class TestVolumeAttributesClassQoS(ManageTest):
             cloned_pvc_obj, constants.STATUS_BOUND, timeout=300
         )
 
-        logger.test_step("[QOS-TC-07] Override the clone with Gold VAC")
+        logger.test_step(f"[{test_id}] Override the clone with Gold VAC")
         gold_patch = json.dumps(
             {"spec": {"volumeAttributesClassName": self.gold_vac_name}}
         )
@@ -619,7 +629,7 @@ class TestVolumeAttributesClassQoS(ManageTest):
             format_type="merge",
         )
 
-        logger.test_step("[QOS-TC-07] Deploy Guaranteed pod on the cloned volume")
+        logger.test_step(f"[{test_id}] Deploy Guaranteed pod on the cloned volume")
         pod_dict = self._guaranteed_fs_pod_dict(
             "cloned-qos-pod", proj.namespace, cloned_pvc_obj.name
         )
@@ -628,23 +638,35 @@ class TestVolumeAttributesClassQoS(ManageTest):
         test_resources_cleanup["pods"].append(pod_obj)
         helpers.wait_for_resource_state(pod_obj, constants.STATUS_RUNNING, timeout=420)
 
-        logger.test_step("[QOS-TC-07] Verify Gold VAC limits govern the clone")
+        logger.test_step(f"[{test_id}] Verify Gold VAC limits govern the clone")
         self.verify_node_cgroup_throttling(pod_obj, self.gold_limits)
 
-        logger.test_step("[QOS-TC-07] Validate active I/O on the cloned volume")
-        self._validate_filesystem_io(pod_obj, "QOS-TC-07")
+        logger.test_step(f"[{test_id}] Validate active I/O on the cloned volume")
+        self._validate_filesystem_io(pod_obj, test_id)
 
-    def test_qos_10_live_mutation_to_unthrottled(
-        self, project_factory, test_resources_cleanup
+    @pytest.mark.parametrize(
+        "test_id, pod_name",
+        [
+            ("live-mutation-to-unthrottled", "mutation-qos-pod"),
+            ("profile-removal-unset", "removal-qos-pod"),
+        ],
+        ids=[
+            "live-mutation-to-unthrottled",
+            "profile-removal-unset",
+        ],
+    )
+    def test_qos_vac_transition_to_unthrottled(
+        self, project_factory, test_resources_cleanup, test_id, pod_name
     ):
-        """QOS-TC-10: Live QoS profile update from Silver to Unthrottled/Max.
+        """Transition a throttled PVC to the unthrottled VAC and verify reset.
 
-        Patching the PVC to the unthrottled VAC and remounting must clear the
-        previously applied device throttling.
+        Covers both live QoS profile mutation and QoS profile removal/unset: a
+        Silver-throttled PVC is moved to the unthrottled VAC and, after the pod
+        remounts, io.max must be reset back to the default (max) throughput.
         """
         proj = project_factory()
 
-        logger.test_step("[QOS-TC-10] Provision PVC and bind Silver VAC")
+        logger.test_step(f"[{test_id}] Provision PVC and bind Silver VAC")
         pvc_obj = helpers.create_pvc(
             sc_name=constants.DEFAULT_STORAGECLASS_RBD,
             size="10Gi",
@@ -661,17 +683,15 @@ class TestVolumeAttributesClassQoS(ManageTest):
             resource_name=pvc_obj.name, params=silver_patch, format_type="merge"
         )
 
-        logger.test_step("[QOS-TC-10] Attach pod and verify initial Silver limits")
-        pod_dict = self._guaranteed_fs_pod_dict(
-            "mutation-qos-pod", proj.namespace, pvc_obj.name
-        )
+        logger.test_step(f"[{test_id}] Attach pod and verify initial Silver limits")
+        pod_dict = self._guaranteed_fs_pod_dict(pod_name, proj.namespace, pvc_obj.name)
         pod_obj = Pod(**pod_dict)
         pod_obj.create()
         test_resources_cleanup["pods"].append(pod_obj)
         helpers.wait_for_resource_state(pod_obj, constants.STATUS_RUNNING, timeout=420)
         self.verify_node_cgroup_throttling(pod_obj, self.silver_limits)
 
-        logger.test_step("[QOS-TC-10] Patch PVC to the unthrottled VAC")
+        logger.test_step(f"[{test_id}] Patch PVC to the unthrottled VAC")
         unthrottled_patch = json.dumps(
             {"spec": {"volumeAttributesClassName": self.unthrottled_vac_name}}
         )
@@ -681,7 +701,7 @@ class TestVolumeAttributesClassQoS(ManageTest):
             format_type="merge",
         )
 
-        logger.test_step("[QOS-TC-10] Restart pod to remount with updated limits")
+        logger.test_step(f"[{test_id}] Restart pod to remount with updated limits")
         pod_obj.delete()
         pod_obj.ocp.wait_for_delete(resource_name=pod_obj.name)
         new_pod_obj = Pod(**pod_dict)
@@ -691,67 +711,8 @@ class TestVolumeAttributesClassQoS(ManageTest):
             new_pod_obj, constants.STATUS_RUNNING, timeout=420
         )
 
-        logger.test_step("[QOS-TC-10] Verify io.max throttling is cleared")
+        logger.test_step(f"[{test_id}] Verify io.max throttling is cleared")
         self.verify_node_cgroup_throttling(new_pod_obj, self.unthrottled_limits)
 
-        logger.test_step("[QOS-TC-10] Validate active I/O after limits are cleared")
-        self._validate_filesystem_io(new_pod_obj, "QOS-TC-10")
-
-    def test_qos_11_qos_profile_removal(self, project_factory, test_resources_cleanup):
-        """QOS-TC-11: QoS profile removal / unset.
-
-        Moving a throttled PVC to the unthrottled VAC and remounting must reset
-        io.max back to the default (max) throughput.
-        """
-        proj = project_factory()
-
-        logger.test_step("[QOS-TC-11] Provision PVC and bind Silver VAC")
-        pvc_obj = helpers.create_pvc(
-            sc_name=constants.DEFAULT_STORAGECLASS_RBD,
-            size="10Gi",
-            namespace=proj.namespace,
-            access_mode=constants.ACCESS_MODE_RWO,
-            volume_mode=constants.VOLUME_MODE_FILESYSTEM,
-        )
-        test_resources_cleanup["pvcs"].append(pvc_obj)
-        helpers.wait_for_resource_state(pvc_obj, constants.STATUS_BOUND, timeout=180)
-        silver_patch = json.dumps(
-            {"spec": {"volumeAttributesClassName": self.silver_vac_name}}
-        )
-        pvc_obj.ocp.patch(
-            resource_name=pvc_obj.name, params=silver_patch, format_type="merge"
-        )
-
-        logger.test_step("[QOS-TC-11] Attach pod and verify initial Silver limits")
-        pod_dict = self._guaranteed_fs_pod_dict(
-            "removal-qos-pod", proj.namespace, pvc_obj.name
-        )
-        pod_obj = Pod(**pod_dict)
-        pod_obj.create()
-        test_resources_cleanup["pods"].append(pod_obj)
-        helpers.wait_for_resource_state(pod_obj, constants.STATUS_RUNNING, timeout=420)
-        self.verify_node_cgroup_throttling(pod_obj, self.silver_limits)
-
-        logger.test_step("[QOS-TC-11] Unset the QoS profile via the unthrottled VAC")
-        unset_patch = json.dumps(
-            {"spec": {"volumeAttributesClassName": self.unthrottled_vac_name}}
-        )
-        pvc_obj.ocp.patch(
-            resource_name=pvc_obj.name, params=unset_patch, format_type="merge"
-        )
-
-        logger.test_step("[QOS-TC-11] Restart pod to remount with limits removed")
-        pod_obj.delete()
-        pod_obj.ocp.wait_for_delete(resource_name=pod_obj.name)
-        new_pod_obj = Pod(**pod_dict)
-        new_pod_obj.create()
-        test_resources_cleanup["pods"].append(new_pod_obj)
-        helpers.wait_for_resource_state(
-            new_pod_obj, constants.STATUS_RUNNING, timeout=420
-        )
-
-        logger.test_step("[QOS-TC-11] Verify io.max reset to default throughput")
-        self.verify_node_cgroup_throttling(new_pod_obj, self.unthrottled_limits)
-
-        logger.test_step("[QOS-TC-11] Validate active I/O after profile removal")
-        self._validate_filesystem_io(new_pod_obj, "QOS-TC-11")
+        logger.test_step(f"[{test_id}] Validate active I/O after limits are cleared")
+        self._validate_filesystem_io(new_pod_obj, test_id)
