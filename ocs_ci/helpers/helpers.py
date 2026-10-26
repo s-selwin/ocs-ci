@@ -5399,19 +5399,26 @@ def retrieve_cli_binary(cli_type="mcg"):
     live_deployment = config.DEPLOYMENT["live_deployment"]
 
     # Determine which image to use based on version and CLI type
+    odf_namespace = version.get_odf_image_namespace(semantic_version)
+    odf_cli_dev_image = constants.ODF_CLI_DEV_IMAGE_TEMPLATE.format(
+        namespace=odf_namespace
+    )
     if live_deployment and semantic_version >= version.VERSION_4_13:
         if semantic_version >= version.VERSION_4_15:
-            image = f"{constants.ODF_CLI_OFFICIAL_IMAGE}:v{semantic_version}"
+            odf_cli_official_image = constants.ODF_CLI_OFFICIAL_IMAGE_TEMPLATE.format(
+                namespace=odf_namespace
+            )
+            image = f"{odf_cli_official_image}:v{semantic_version}"
         else:
             image = f"{constants.MCG_CLI_OFFICIAL_IMAGE}:v{semantic_version}"
     else:
         # Development builds
         if semantic_version >= version.VERSION_4_20:
             # For 4.20+ dev builds, always use ODF CLI
-            image = f"{constants.ODF_CLI_DEV_IMAGE}:{ocs_build}"
+            image = f"{odf_cli_dev_image}:{ocs_build}"
         elif cli_type == "odf" and semantic_version >= version.VERSION_4_15:
             # For 4.15+ dev builds requesting odf-cli
-            image = f"{constants.ODF_CLI_DEV_IMAGE}:{ocs_build}"
+            image = f"{odf_cli_dev_image}:{ocs_build}"
         else:
             # For older versions or mcg-cli requests in dev
             image = f"{constants.MCG_CLI_DEV_IMAGE}:{ocs_build}"
@@ -7839,6 +7846,7 @@ def create_userns_pod(
     namespace,
     run_as_user=10900,
     run_as_group=10900,
+    fs_group=10000,
     interface_type=None,
     node_name=None,
     mount_path="/mnt/test",
@@ -7856,6 +7864,9 @@ def create_userns_pod(
         namespace (str): Target namespace
         run_as_user (int): Container UID (default 10900)
         run_as_group (int): Container GID (default 10900)
+        fs_group (int): fsGroup value for pod securityContext
+            (default 10000). Must be within namespace's
+            supplemental-groups range for restricted-v2 SCC.
         interface_type (str): CephFileSystem or CephBlockPool
             (default CephFileSystem)
         node_name (str): Schedule on this node (optional)
@@ -7884,6 +7895,8 @@ def create_userns_pod(
         scc={
             "runAsUser": run_as_user,
             "runAsGroup": run_as_group,
+            "fsGroup": fs_group,
+            "supplementalGroups": [fs_group],
             "runAsNonRoot": True,
         },
         volumemounts=[

@@ -2274,11 +2274,24 @@ def get_managed_cluster_node_ips():
     """
     restore_index = config.cur_index
     primary_index = get_primary_cluster_config().MULTICLUSTER["multicluster_index"]
-    secondary_index = [
-        s.MULTICLUSTER["multicluster_index"]
-        for s in get_non_acm_cluster_config()
-        if s.MULTICLUSTER["multicluster_index"] != primary_index
-    ][0]
+    dr_cluster_relations = config.MULTICLUSTER.get("dr_cluster_relations", [])
+    if dr_cluster_relations:
+        # dr_cluster_relations is a list containing cluster pairs list with the index 0 pair as current pair under test
+        dr_cluster_names = dr_cluster_relations[0]
+        primary_name = config.get_cluster_name_by_index(primary_index)
+        secondary_index = config.get_cluster_index_by_name(
+            [
+                cluster_name
+                for cluster_name in dr_cluster_names
+                if cluster_name != primary_name
+            ][0]
+        )
+    else:
+        secondary_index = [
+            s.MULTICLUSTER["multicluster_index"]
+            for s in get_non_acm_cluster_config()
+            if s.MULTICLUSTER["multicluster_index"] != primary_index
+        ][0]
     cluster_name_primary = config.clusters[primary_index].ENV_DATA["cluster_name"]
     cluster_name_secondary = config.clusters[secondary_index].ENV_DATA["cluster_name"]
     cluster_data = [
@@ -2575,8 +2588,7 @@ def verify_drpolicy_cli(switch_ctx=None):
 
     restore_index = config.cur_index
     config.switch_ctx(switch_ctx) if switch_ctx else config.switch_acm_ctx()
-    drpolicy_obj = ocp.OCP(kind=constants.DRPOLICY)
-    drpolicy_items = drpolicy_obj.get().get("items") or []
+    drpolicy_items = get_all_drpolicy()
     if not drpolicy_items:
         config.switch_ctx(restore_index)
         raise UnexpectedBehaviour("No DRPolicy resources found on hub")
@@ -3264,6 +3276,33 @@ def wait_for_vrg_state(vrg_state, vrg_namespace, resource_name, timeout=900):
         resource_name=resource_name,
         timeout=timeout,
     )
+
+
+def wait_for_drpc_progression_completed(
+    namespace, resource_name, timeout=600, sleep=10
+):
+    """
+    Wait until the given DRPC reaches Completed progression.
+
+    Args:
+        namespace (str): Namespace of the DRPC
+        resource_name (str): DRPC resource name
+        timeout (int): Time in seconds to wait (default: 600)
+        sleep (int): Seconds between polls (default: 10)
+
+    Raises:
+        AssertionError: If progression does not reach Completed within timeout
+
+    """
+    with config.RunWithAcmConfigContext():
+        drpc_obj = DRPC(namespace=namespace, resource_name=resource_name)
+        logger.info(
+            f"Waiting for DRPC {resource_name} in namespace {namespace} "
+            f"to reach progression {constants.STATUS_COMPLETED}"
+        )
+        drpc_obj.wait_for_progression_status(
+            status=constants.STATUS_COMPLETED, timeout=timeout, sleep=sleep
+        )
 
 
 def validate_storage_cluster_peer_state():
@@ -4550,14 +4589,23 @@ def validate_application_odf_cli(
     Returns:
         str or None: The stdout output from the command,
             or None if any cluster in the multicluster config is a hosted
-            cluster, or if gather failed.
+            cluster, or if gather failed, or if
+            ``skip_odf_cli_validation`` is set in ENV_DATA.
 
     Note:
         Returns None immediately (without running any command) when any
-        cluster in ``config.clusters`` has ``is_hosted=True``.  Skips
-        the test on validation failure.
+        cluster in ``config.clusters`` has ``is_hosted=True``, or when
+        ``skip_odf_cli_validation`` is ``True`` in ``config.ENV_DATA``.
+        Skips the test on validation failure.
 
     """
+    if config.ENV_DATA.get("skip_odf_cli_validation", False):
+        logger.info(
+            f"Skipping ODF CLI DR {action} for DRPC '{drpc_name}': "
+            f"'skip_odf_cli_validation' is set in ENV_DATA"
+        )
+        return None
+
     for cluster in config.clusters:
         if cluster.MULTICLUSTER.get("is_hosted", False):
             cluster_name = cluster.MULTICLUSTER.get(
@@ -4729,12 +4777,32 @@ def validate_cluster_odf_cli(retries=5, retry_interval=60):
         retry_interval (int): Seconds to wait between retries.
 
     Returns:
-        str: The stdout output from the validation command
+        str or None: The stdout output from the validation command,
+            or None if any cluster in the multicluster config is a hosted
+            cluster, or if ``skip_odf_cli_validation`` is set in ENV_DATA.
 
     Raises:
         CommandFailed: If the ODF CLI command fails
 
     """
+    if config.ENV_DATA.get("skip_odf_cli_validation", False):
+        logger.info(
+            "Skipping ODF CLI DR validate clusters: "
+            "'skip_odf_cli_validation' is set in ENV_DATA"
+        )
+        return None
+
+    for cluster in config.clusters:
+        if cluster.MULTICLUSTER.get("is_hosted", False):
+            cluster_name = cluster.MULTICLUSTER.get(
+                "name", cluster.ENV_DATA.get("cluster_name", "unknown")
+            )
+            logger.info(
+                f"Skipping ODF CLI DR validate clusters: "
+                f"cluster '{cluster_name}' is a hosted cluster"
+            )
+            return None
+
     output_dir = os.path.join(
         os.path.expanduser(config.RUN["log_dir"]),
         f"odf_dr_validate_clusters_{config.RUN['run_id']}",
